@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::sync::Mutex;
 use windows::{
     core::*,
     Win32::{
@@ -9,9 +10,7 @@ use windows::{
     },
 };
 
-const WINDOW_CLASS_NAME: PCSTR = windows::core::s!("UIInspectorOverlay");
-
-static mut GLOBAL_ELEMENTS: Vec<(RECT, String)> = Vec::new();
+static GLOBAL_ELEMENTS: Mutex<Vec<(RECT, String)>> = Mutex::new(Vec::new());
 
 fn get_control_type_name(type_id: UIA_CONTROLTYPE_ID) -> &'static str {
     match type_id.0 {
@@ -125,62 +124,66 @@ unsafe extern "system" fn window_proc(
             SetBkMode(hdc, BACKGROUND_MODE(1)); // Transparent background
             SetTextColor(hdc, text_color);
 
-            // Sort elements by size (area) to draw larger boxes first
-            let mut sorted_elements = GLOBAL_ELEMENTS.clone();
-            sorted_elements.sort_by_key(|(rect, _)| {
-                -((rect.right - rect.left) * (rect.bottom - rect.top)) // Negative for descending order
-            });
+            // Safely access the global elements through Mutex
+            if let Ok(global_elements) = GLOBAL_ELEMENTS.lock() {
+                // Sort elements by size (area) to draw larger boxes first
+                let mut sorted_elements = global_elements.clone();
+                sorted_elements.sort_by_key(|(rect, _)| {
+                    -((rect.right - rect.left) * (rect.bottom - rect.top)) // Negative for descending order
+                });
 
-            // Draw boxes and labels for all elements
-            for (rect, info) in &sorted_elements {
-                if rect.right - rect.left > 0 && rect.bottom - rect.top > 0 {
-                    // Draw rectangle
-                    Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+                // Draw boxes and labels for all elements
+                for (rect, info) in &sorted_elements {
+                    if rect.right - rect.left > 0 && rect.bottom - rect.top > 0 {
+                        // Draw rectangle and handle the result
+                        let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
 
-                    // Calculate label position
-                    // Position the label inside the component if there's room, otherwise above it
-                    let mut label_rect = RECT {
-                        left: rect.left + 5,
-                        right: rect.right - 5,
-                        top: if rect.bottom - rect.top > 25 {
-                            rect.top + 5
-                        } else {
-                            rect.top.saturating_sub(20)
-                        },
-                        bottom: if rect.bottom - rect.top > 25 {
-                            rect.top + 25
-                        } else {
-                            rect.top
-                        },
-                    };
+                        // Calculate label position
+                        let mut label_rect = RECT {
+                            left: rect.left + 5,
+                            right: rect.right - 5,
+                            top: if rect.bottom - rect.top > 25 {
+                                rect.top + 5
+                            } else {
+                                rect.top.saturating_sub(20)
+                            },
+                            bottom: if rect.bottom - rect.top > 25 {
+                                rect.top + 25
+                            } else {
+                                rect.top
+                            },
+                        };
 
-                    // Create background for text
-                    SetBkMode(hdc, BACKGROUND_MODE(2)); // OPAQUE
-                    SetBkColor(hdc, COLORREF(0)); // Black background
+                        // Create background for text
+                        SetBkMode(hdc, BACKGROUND_MODE(2)); // OPAQUE
+                        SetBkColor(hdc, COLORREF(0)); // Black background
 
-                    let c_string =
-                        CString::new(format!("{} ({},{})", info, rect.left, rect.top)).unwrap();
-                    let mut text_bytes = c_string.as_bytes_with_nul().to_vec();
+                        let c_string =
+                            CString::new(format!("{} ({},{})", info, rect.left, rect.top)).unwrap();
+                        let mut text_bytes = c_string.as_bytes_with_nul().to_vec();
 
-                    DrawTextA(
-                        hdc,
-                        &mut text_bytes,
-                        &mut label_rect,
-                        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
-                    );
+                        DrawTextA(
+                            hdc,
+                            &mut text_bytes,
+                            &mut label_rect,
+                            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+                        );
 
-                    SetBkMode(hdc, BACKGROUND_MODE(1)); // Back to transparent
+                        SetBkMode(hdc, BACKGROUND_MODE(1)); // Back to transparent
+                    }
                 }
             }
 
-            DeleteObject(HGDIOBJ(box_pen.0));
-            EndPaint(hwnd, &ps);
+            let _ = DeleteObject(HGDIOBJ(box_pen.0));
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_CHAR => {
             match wparam.0 as u8 as char {
                 'q' | 'Q' => {
-                    DestroyWindow(hwnd);
+                    if let Err(e) = DestroyWindow(hwnd) {
+                        println!("Error destroying window: {:?}", e);
+                    }
                 }
                 _ => {}
             }
@@ -198,23 +201,23 @@ fn create_overlay_window() -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleA(None)?;
 
-        let wc = WNDCLASSA {
+        let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: HINSTANCE(instance.0),
-            lpszClassName: WINDOW_CLASS_NAME,
+            lpszClassName: w!("UIInspectorOverlay"),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()
         };
 
-        let atom = RegisterClassA(&wc);
+        let atom = RegisterClassW(&wc);
         if atom == 0 {
             return Err(Error::from_win32());
         }
 
-        let hwnd = CreateWindowExA(
+        let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
-            WINDOW_CLASS_NAME,
-            windows::core::s!("UI Inspector Overlay"),
+            w!("UIInspectorOverlay"),
+            w!("UI Inspector Overlay"),
             WS_POPUP | WS_VISIBLE,
             0,
             0,
@@ -226,24 +229,53 @@ fn create_overlay_window() -> Result<HWND> {
             None,
         )?;
 
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), 180, LWA_ALPHA);
+        if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 180, LWA_ALPHA) {
+            println!("Warning: Failed to set window transparency: {:?}", e);
+        }
 
         Ok(hwnd)
     }
 }
 
 fn main() -> Result<()> {
+    // Get command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        println!("Usage: {} <window-title>", args[0]);
+        println!("Example: {} \"Calculator\"", args[0]);
+        println!("Example: {} \"Task Manager\"", args[0]);
+        return Ok(());
+    }
+
+    // Join all arguments after the program name to support window titles with spaces
+    let window_title = &args[1..].join(" ");
+
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
-        let target_window = FindWindowA(None, windows::core::s!("Calculator"))?;
+        println!("Searching for window with title: {}", window_title);
+
+        // Convert the string to UTF-16
+        let window_title_utf16: Vec<u16> = window_title
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let target_window = FindWindowW(None, PCWSTR::from_raw(window_title_utf16.as_ptr()))?;
 
         if target_window.is_invalid() {
-            println!("Calculator window not found. Please open Calculator first.");
+            println!("Window '{}' not found. Make sure the application is running and the window title is exact.", window_title);
+            println!("\nTips:");
+            println!("- Window titles are case-sensitive");
+            println!(
+                "- Some applications might have different window titles than their program names"
+            );
+            println!("- Try running the application first before running this tool");
             return Ok(());
         }
 
-        println!("UI Elements in Calculator:");
+        // Rest of the code remains the same
+        println!("UI Elements in {}:", window_title);
         println!("Press 'Q' to quit the overlay");
 
         let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)?;
@@ -255,7 +287,11 @@ fn main() -> Result<()> {
         // Then collect all elements for visualization
         let mut elements = Vec::new();
         collect_element_info(&root_element, &mut elements)?;
-        GLOBAL_ELEMENTS = elements;
+
+        // Safely set the global elements
+        if let Ok(mut global_elements) = GLOBAL_ELEMENTS.lock() {
+            *global_elements = elements;
+        }
 
         // Create overlay window
         let _overlay_hwnd = create_overlay_window()?;
@@ -263,8 +299,8 @@ fn main() -> Result<()> {
         // Message loop
         let mut message = MSG::default();
         while GetMessageA(&mut message, None, 0, 0).into() {
-            TranslateMessage(&message);
-            DispatchMessageA(&message);
+            let _ = TranslateMessage(&message);
+            let _ = DispatchMessageA(&message);
         }
     }
     Ok(())
