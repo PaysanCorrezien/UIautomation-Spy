@@ -4,7 +4,7 @@ A simple tool to inspect the UI Automation Tree of any application.
 
 It print the tree of the UI Automation elements in the console, and display the `rect` of the elements in the screen and the element value.
 
-![Calculator](./assets/calculator.png)
+![Calculator](./.assets/calculator.png)
 
 ## Usage
 
